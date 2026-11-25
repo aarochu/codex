@@ -1283,11 +1283,10 @@ fn pty_terminate_reaps_child_when_waiter_is_queued() -> anyhow::Result<()> {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn pty_with_dispatch_name_uses_child_home_and_path() -> anyhow::Result<()> {
+async fn pty_with_dispatch_name_resolves_program_from_cwd_and_path() -> anyhow::Result<()> {
     let home = tempfile::tempdir()?;
     std::fs::create_dir_all(home.path().join("bin/tools"))?;
     std::os::unix::fs::symlink("/bin/sh", home.path().join("bin/tools/sh"))?;
-    let missing_cwd = home.path().join("missing");
     let env = HashMap::from([(
         "HOME".to_owned(),
         home.path().to_str().expect("temp path").to_owned(),
@@ -1303,7 +1302,7 @@ async fn pty_with_dispatch_name_uses_child_home_and_path() -> anyhow::Result<()>
         spawn_pty_process(
             program,
             &args,
-            &missing_cwd,
+            home.path(),
             env,
             &arg0,
             TerminalSize::default(),
@@ -1323,6 +1322,68 @@ async fn pty_with_dispatch_name_uses_child_home_and_path() -> anyhow::Result<()>
         assert_eq!(
             (child.exit_rx.await?, output),
             (0, b"pty-dispatch".to_vec())
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn pty_spawn_rejects_missing_cwd_instead_of_running_in_home() -> anyhow::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let home = tempfile::tempdir()?;
+    let missing_cwd = home.path().join("deleted-worktree");
+    let mut env: HashMap<String, String> = std::env::vars().collect();
+    env.insert(
+        "HOME".to_owned(),
+        home.path().to_str().expect("temp path").to_owned(),
+    );
+    let attached = std::fs::File::open("/dev/null")?;
+    let attached_fds = [attached.as_raw_fd()];
+    let args = ["-c".to_owned(), "pwd".to_owned()];
+
+    // Cover the plain launch (unified exec without a shell snapshot), the
+    // launch that attaches a snapshot descriptor, and the dispatch-name launch.
+    // The plain and dispatch-name launches used to run in $HOME instead.
+    for (fds, arg0) in [
+        (crate::ChildFds::Inherited(&[]), None),
+        (crate::ChildFds::Attached(&attached_fds), None),
+        (
+            crate::ChildFds::Inherited(&[]),
+            Some("pty-dispatch".to_owned()),
+        ),
+    ] {
+        let result = spawn_pty_process(
+            "/bin/sh",
+            &args,
+            &missing_cwd,
+            &env,
+            &arg0,
+            TerminalSize::default(),
+            fds,
+        )
+        .await;
+        let err = match result {
+            Ok(spawned) => {
+                let (session, output_rx, exit_rx) = combine_spawned_output(spawned);
+                let (output, _) =
+                    collect_output_until_exit(output_rx, exit_rx, /*timeout_ms*/ 5_000).await;
+                session.terminate();
+                anyhow::bail!(
+                    "PTY spawned in a missing cwd and printed {:?}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            Err(err) => err,
+        };
+        let io_err = err
+            .downcast_ref::<std::io::Error>()
+            .unwrap_or_else(|| panic!("expected an io::Error, got: {err:#}"));
+        assert_eq!(io_err.kind(), std::io::ErrorKind::NotFound);
+        assert!(
+            err.to_string().contains(&missing_cwd.display().to_string()),
+            "error should name the missing directory, got: {err}"
         );
     }
     Ok(())

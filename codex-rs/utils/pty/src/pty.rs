@@ -159,6 +159,17 @@ pub async fn spawn_process(
     if program.is_empty() {
         anyhow::bail!("missing program for PTY spawn");
     }
+    // portable-pty and ConPTY quietly start the child in the home directory
+    // when the requested cwd is gone. Callers report the cwd they asked for,
+    // so running anywhere else would put the command in the wrong tree. Fail
+    // the same way the pipe backend does instead.
+    if !cwd.is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("working directory {} does not exist", cwd.display()),
+        )
+        .into());
+    }
 
     #[cfg(not(unix))]
     let program = {
@@ -174,9 +185,8 @@ pub async fn spawn_process(
         && inherited_fds.as_slice().is_empty()
         && Path::new(program).is_absolute()
         && arg0.is_none()
-        && cwd.is_dir()
     {
-        // Keep portable-pty's PATH and missing-cwd behavior for ordinary launches.
+        // Keep portable-pty's PATH behavior for ordinary launches.
         return spawn_process_preserving_fds(program, args, cwd, env, arg0, size, inherited_fds)
             .await;
     }
@@ -322,32 +332,21 @@ async fn spawn_process_portable(
 }
 
 #[cfg(unix)]
-fn portable_launch_paths(
+fn portable_program_path(
     program: &OsStr,
     cwd: &Path,
     env: &HashMap<String, String>,
-) -> Result<(PathBuf, PathBuf)> {
+) -> Result<PathBuf> {
     use anyhow::Context;
     use nix::unistd::AccessFlags;
-    use nix::unistd::User;
     use nix::unistd::access;
-    use nix::unistd::getuid;
     use std::path::Component;
 
-    let cwd = if cwd.is_dir() {
-        cwd.to_owned()
-    } else if let Some(home) = env.get("HOME") {
-        PathBuf::from(home)
-    } else if let Ok(Some(user)) = User::from_uid(getuid()) {
-        PathBuf::from(user.dir.to_str().context("failed to resolve home dir")?)
-    } else {
-        PathBuf::from("/")
-    };
     let program = Path::new(program);
     // portable-pty searches even names containing slashes unless they start with /, ./, or ../.
     let program = if matches!(program.components().next(), Some(Component::Normal(_))) {
         let path = env.get("PATH").context("Unable to resolve the PATH")?;
-        let base = std::path::absolute(&cwd)?;
+        let base = std::path::absolute(cwd)?;
         std::env::split_paths(path)
             .map(|dir| base.join(dir).join(program))
             .find(|candidate| !candidate.is_dir() && access(candidate, AccessFlags::X_OK).is_ok())
@@ -360,7 +359,7 @@ fn portable_launch_paths(
     } else {
         program.to_owned()
     };
-    Ok((program, cwd))
+    Ok(program)
 }
 
 #[cfg(unix)]
@@ -376,11 +375,11 @@ async fn spawn_process_preserving_fds(
     // A distinct argv[0] needs a native spawn. Keep the lookup behavior that
     // portable-pty supplies for launches without extra descriptors.
     let resolved;
-    let (program, cwd) = if arg0.is_some() && descriptors.as_slice().is_empty() {
-        resolved = portable_launch_paths(program, cwd, env)?;
-        (resolved.0.as_os_str(), resolved.1.as_path())
+    let program = if arg0.is_some() && descriptors.as_slice().is_empty() {
+        resolved = portable_program_path(program, cwd, env)?;
+        resolved.as_os_str()
     } else {
-        (program, cwd)
+        program
     };
     let (master, slave) = open_unix_pty(size)?;
     let io = crate::unix_io::PtyIo::new(master.as_raw_fd())?;
